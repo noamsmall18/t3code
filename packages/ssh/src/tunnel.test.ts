@@ -12,6 +12,7 @@ import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -701,18 +702,27 @@ describe("ssh tunnel scripts", () => {
       }),
   );
 
-  it.effect("closes every local tunnel without stopping the remote servers", () =>
+  it.effect("closes connected and connecting local tunnels without stopping remote servers", () =>
     Effect.gen(function* () {
-      let tunnelKills = 0;
+      const killedTunnels = new Set<string>();
+      const connectingTunnelSpawned = yield* Deferred.make<void>();
       let remoteStops = 0;
+      let nextLocalPort = 41_773;
+      const connectingPort = 41_774;
       const spawner = ChildProcessSpawner.make((command) =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
           const args = commandArgs(command);
           if (args.includes("-G")) return makeSuccessfulProcess("");
           if (args.includes("-N")) {
-            return makeRunningProcess(() => {
-              tunnelKills += 1;
-            });
+            const host = args.at(-1) ?? "";
+            if (args.includes(`${connectingPort}:127.0.0.1:3773`)) {
+              yield* Deferred.succeed(connectingTunnelSpawned, undefined);
+            }
+            // Like the real spawner, closing the spawn scope kills the process.
+            return yield* Effect.acquireRelease(
+              Effect.succeed(makeRunningProcess(() => killedTunnels.add(host))),
+              (tunnel) => tunnel.kill().pipe(Effect.ignore),
+            );
           }
           if (args.some((arg, index) => arg === "-s" && args[index + 1] === "--")) {
             return makeSuccessfulProcess('{"remotePort":3773}\n');
@@ -726,24 +736,39 @@ describe("ssh tunnel scripts", () => {
         NodeCrypto.layer,
         Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Layer.succeed(HttpClient.HttpClient, testHttpClient),
-        Layer.succeed(NetService.NetService, testNetService),
+        Layer.succeed(
+          NetService.NetService,
+          NetService.NetService.of({
+            ...testNetService,
+            reserveLoopbackPort: () => Effect.sync(() => nextLocalPort++),
+            hasListenerOnHost: (port) => Effect.succeed(port !== connectingPort),
+          }),
+        ),
         SshAuth.SshPasswordPrompt.disabledLayer,
         SshTunnel.SshEnvironmentManager.layer({ resolveCliRunner: Effect.succeed(ARCHIVE) }),
       );
       yield* Effect.gen(function* () {
         const manager = yield* SshTunnel.SshEnvironmentManager;
-        for (const host of ["devbox", "other"]) {
-          yield* manager.ensureEnvironment({
-            alias: host,
-            hostname: host,
+        yield* manager.ensureEnvironment({
+          alias: "devbox",
+          hostname: "devbox",
+          username: null,
+          port: null,
+        });
+        const connecting = yield* Effect.forkChild(
+          manager.ensureEnvironment({
+            alias: "other",
+            hostname: "other",
             username: null,
             port: null,
-          });
-        }
+          }),
+        );
+        yield* Deferred.await(connectingTunnelSpawned);
 
         yield* manager.closeLocalTunnels();
 
-        assert.equal(tunnelKills, 2);
+        assert.isTrue(Exit.isFailure(yield* Fiber.await(connecting)));
+        assert.deepEqual([...killedTunnels].sort(), ["devbox", "other"]);
         assert.equal(remoteStops, 0);
       }).pipe(Effect.provide(layer), Effect.scoped);
     }),

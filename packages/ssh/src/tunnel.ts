@@ -1475,6 +1475,7 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
 ): Effect.fn.Return<SshEnvironmentManagerShape, never, Scope.Scope> {
   const managerScope = yield* Scope.Scope;
   const tunnels = new Map<string, SshTunnelEntry>();
+  const connectingTunnelScopes = new Set<Scope.Closeable>();
   const targetLocks = yield* KeyedLock.make<string>();
   const authSecrets = new Map<string, string>();
 
@@ -1662,6 +1663,7 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
       remotePort,
     });
     const entryScope = yield* Scope.make("sequential");
+    connectingTunnelScopes.add(entryScope);
     const tunnelEntry = yield* runWithSshAuth({
       key: input.key,
       target: input.resolvedTarget,
@@ -1679,9 +1681,19 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
         }),
     }).pipe(
       Effect.onExit((exit) =>
-        Exit.isSuccess(exit) ? Effect.void : Scope.close(entryScope, Exit.void).pipe(Effect.ignore),
+        Exit.isSuccess(exit)
+          ? Effect.void
+          : Effect.sync(() => connectingTunnelScopes.delete(entryScope)).pipe(
+              Effect.andThen(Scope.close(entryScope, Exit.void)),
+              Effect.ignore,
+            ),
       ),
     );
+    if (!connectingTunnelScopes.delete(entryScope)) {
+      return yield* new SshReadinessError({
+        message: `SSH tunnel to ${input.resolvedTarget.alias} was closed while connecting.`,
+      });
+    }
     tunnels.set(input.key, tunnelEntry);
     const spawnerService = yield* ChildProcessSpawner.ChildProcessSpawner;
     const digestService = yield* Digest.Digest;
@@ -1905,9 +1917,16 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
 
   const closeLocalTunnels = Effect.fn("ssh/tunnel.closeLocalTunnels")(function* () {
     const entries = [...tunnels.values()];
+    // Closing a connecting scope kills its spawned ssh before it reaches the map.
+    const connectingScopes = [...connectingTunnelScopes];
     // Entries no longer in the map skip the remote stop in their finalizer.
     tunnels.clear();
+    connectingTunnelScopes.clear();
     yield* Effect.forEach(entries, closeTunnelEntry, { concurrency: "unbounded", discard: true });
+    yield* Effect.forEach(connectingScopes, (scope) => Scope.close(scope, Exit.void), {
+      concurrency: "unbounded",
+      discard: true,
+    });
   });
 
   return SshEnvironmentManager.of({ ensureEnvironment, disconnectEnvironment, closeLocalTunnels });
